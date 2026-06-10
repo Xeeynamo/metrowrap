@@ -23,6 +23,7 @@ use crate::compiler::Compiler;
 use crate::constants::*;
 use crate::elf::Elf;
 use crate::elf::STB_LOCAL;
+use crate::elf::STT_SECTION;
 use crate::elf::Section;
 use crate::elf::section::{Relocation, RelocationRecord};
 use crate::makerule::MakeRule;
@@ -329,6 +330,17 @@ pub fn process_c_file(
         let initial_sh_info_value = compiled_elf.symtab().section.sh_info;
         let mut local_syms_inserted: usize = 0;
 
+        // Relocation sections already present before this asm file is merged.
+        // Inserting local symbols shifts global symbol indices, so only these
+        // pre-existing relocations need their indices bumped; the records added
+        // for the current file below already receive post-insertion indices from
+        // add_symbol_get_index and must not be bumped again.
+        let preexisting_reloc_indices: std::collections::HashSet<usize> = compiled_elf
+            .reloc_sections()
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect();
+
         // assumes .text relocations precede .rodata relocations
         for (i, (_, relocation_record)) in relocation_records.into_iter().enumerate() {
             let mut relocation_record = relocation_record.clone();
@@ -346,8 +358,31 @@ pub fn process_c_file(
 
             for relocation in &mut rr.relocations {
                 let symbol = &mut assembled_symtab.symbols[relocation.symbol_index()];
-                if symbol.bind() == 0 {
-                    local_syms_inserted += 1;
+                let is_local = symbol.bind() == 0;
+
+                // Function-internal jumps (e.g. `j .Llabel`) assemble to a
+                // section-relative relocation against the assembled object's
+                // `.text` section symbol, with the target encoded as a
+                // function-relative addend. After transplanting the function into
+                // its own `.text` section in the compiled object, repoint the
+                // relocation at that section's symbol so the addend resolves
+                // correctly instead of against the first `.text` section.
+                if !asm_text.is_empty()
+                    && i == 0
+                    && symbol.type_id() == STT_SECTION
+                    && symbol.name == ".text"
+                {
+                    // mwcc emits no `.text` section symbols, so repoint the
+                    // function-internal jump at the function symbol itself (which
+                    // sits at offset 0 of the transplanted section). The
+                    // function-relative addend in the instruction then resolves
+                    // correctly: func_addr + addend.
+                    if let Some((idx, _)) =
+                        compiled_elf.symtab().get_symbol_by_name(asm_object.main_symbol)
+                    {
+                        relocation.set_symbol_index(idx as u32);
+                        continue;
+                    }
                 }
 
                 let force = asm_text.is_empty() || i != 0;
@@ -356,7 +391,16 @@ pub fn process_c_file(
                     symbol.st_shndx = text_section_index as u16;
                 }
 
+                // A local symbol only shifts existing global indices when it is
+                // actually inserted into the table (it goes at sh_info). If the
+                // symbol already exists it is reused, so nothing shifts. Counting
+                // unconditionally over-bumps prior relocations.
+                let sym_count_before = compiled_elf.symtab().symbols.len();
                 let index = compiled_elf.add_symbol_get_index(symbol.clone(), force) as u32;
+                let inserted = compiled_elf.symtab().symbols.len() > sym_count_before;
+                if is_local && inserted {
+                    local_syms_inserted += 1;
+                }
                 relocation.set_symbol_index(index);
                 reloc_symbols.insert(symbol.name.clone());
             }
@@ -372,8 +416,12 @@ pub fn process_c_file(
             for (idx, relocation_section) in relocation_sections {
                 let mut relocation_record = RelocationRecord::new(relocation_section.clone());
 
-                // Check if this is a rodata relocation that needs splitting
-                if relocation_record.section.sh_info == rodata_section_indices[0] as u32 {
+                // Check if this is a rodata relocation that needs splitting.
+                // Text-only asm has no rodata sections, so skip straight to the
+                // symbol-index update below.
+                if !rodata_section_indices.is_empty()
+                    && relocation_record.section.sh_info == rodata_section_indices[0] as u32
+                {
                     if num_rodata_symbols == 1 {
                         continue; // nothing to do
                     }
@@ -417,6 +465,12 @@ pub fn process_c_file(
                         }
                     }
 
+                    continue;
+                }
+
+                // Only bump pre-existing relocations; the current file's records
+                // already hold post-insertion indices.
+                if !preexisting_reloc_indices.contains(&idx) {
                     continue;
                 }
 

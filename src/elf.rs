@@ -366,6 +366,15 @@ impl Elf {
             .collect()
     }
 
+    /// Index of the STT_SECTION symbol whose `st_shndx` is `section_index`, if any.
+    /// Used to repoint section-relative (e.g. function-internal `j`) relocations
+    /// at the correct transplanted `.text` section.
+    pub fn section_symbol_index(&self, section_index: usize) -> Option<usize> {
+        self.symtab().symbols.iter().position(|s| {
+            s.type_id() == STT_SECTION && s.st_shndx as usize == section_index
+        })
+    }
+
     pub fn relocation_sections(&self) -> Vec<RelocationRecord> {
         self.sections
             .iter()
